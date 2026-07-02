@@ -12,6 +12,7 @@ keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]
 categories = ["accessibility", "simulation"]
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread", "test-util"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 rust_decimal_macros = { workspace = true }
 
@@ -26,7 +27,7 @@ tracing = { workspace = true }
 
 # Async
 tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread"] }
-tokio-stream = { workspace = true, features = ["sync"] }
+tokio-stream = { workspace = true, features = ["sync", "time"] }
 futures = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
