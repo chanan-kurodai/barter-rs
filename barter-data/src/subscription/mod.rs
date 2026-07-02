@@ -259,6 +259,9 @@ pub fn exchange_supports_instrument_kind_sub_kind(
 
     match (exchange_id, instrument_kind, sub_kind) {
         (BinanceSpot, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2) => true,
+        (BinanceTh, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2) => true,
+        (Bitkub, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2) => true,
+        (Orbix, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2) => true,
         (
             BinanceFuturesUsd,
             Perpetual,

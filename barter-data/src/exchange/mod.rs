@@ -14,6 +14,25 @@ use url::Url;
 /// `BinanceSpot` & `BinanceFuturesUsd` [`Connector`] and [`StreamSelector`] implementations.
 pub mod binance;
 
+/// `BinanceTh` (Binance Thailand) [`Connector`] + custom dual-WS [`MarketStream`].
+///
+/// Source lives outside this crate, at `hairpin-main/crates/connector/binanceth/data/src/`,
+/// pulled in here via `#[path]` so the fork delta stays additive-only.
+#[path = "../../../../../crates/connector/binanceth/data/src/mod.rs"]
+pub mod binanceth;
+
+/// `Bitkub` (Thai exchange) [`Connector`] — URL-path subscribe, custom MarketStream.
+/// Source lives outside this crate, at `hairpin-main/crates/connector/bitkub/data/src/`,
+/// pulled in via `#[path]` to satisfy the orphan rule (same as `binanceth`).
+#[path = "../../../../../crates/connector/bitkub/data/src/mod.rs"]
+pub mod bitkub;
+
+/// `Orbix` (Thai exchange) [`Connector`] — Binance-compatible JSON subscribe.
+/// Source lives outside this crate, at `hairpin-main/crates/connector/orbix/data/src/`,
+/// pulled in via `#[path]` to satisfy the orphan rule (same as `binanceth`).
+#[path = "../../../../../crates/connector/orbix/data/src/mod.rs"]
+pub mod orbix;
+
 /// `Bitfinex` [`Connector`] and [`StreamSelector`] implementations.
 pub mod bitfinex;
 

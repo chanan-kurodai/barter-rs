@@ -39,11 +39,13 @@ pub enum ExchangeId {
     BinanceOptions,
     BinancePortfolioMargin,
     BinanceSpot,
+    BinanceTh,
     BinanceUs,
     Bitazza,
     Bitfinex,
     Bitflyer,
     Bitget,
+    Bitkub,
     Bitmart,
     BitmartFuturesUsd,
     Bitmex,
@@ -73,6 +75,7 @@ pub enum ExchangeId {
     Liquid,
     Mexc,
     Okx,
+    Orbix,
     Poloniex,
 }
 
@@ -88,11 +91,13 @@ impl ExchangeId {
             ExchangeId::BinanceOptions => "binance_options",
             ExchangeId::BinancePortfolioMargin => "binance_portfolio_margin",
             ExchangeId::BinanceSpot => "binance_spot",
+            ExchangeId::BinanceTh => "binance_th",
             ExchangeId::BinanceUs => "binance_us",
             ExchangeId::Bitazza => "bitazza",
             ExchangeId::Bitfinex => "bitfinex",
             ExchangeId::Bitflyer => "bitflyer",
             ExchangeId::Bitget => "bitget",
+            ExchangeId::Bitkub => "bitkub",
             ExchangeId::Bitmart => "bitmart",
             ExchangeId::BitmartFuturesUsd => "bitmart_futures_usd",
             ExchangeId::Bitmex => "bitmex",
@@ -121,6 +126,7 @@ impl ExchangeId {
             ExchangeId::Liquid => "liquid",
             ExchangeId::Mexc => "mexc",
             ExchangeId::Okx => "okx",
+            ExchangeId::Orbix => "orbix",
             ExchangeId::Poloniex => "poloniex",
         }
     }
