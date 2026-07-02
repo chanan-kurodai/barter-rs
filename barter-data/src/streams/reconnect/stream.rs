@@ -4,7 +4,7 @@ use derive_more::Constructor;
 use futures::Stream;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{convert, fmt::Debug, future, future::Future};
+use std::{convert, fmt::Debug, future, future::Future, time::Duration};
 use tracing::{error, info, warn};
 
 /// Utilities for handling a continually reconnecting [`Stream`] initialised via the
@@ -51,6 +51,47 @@ where
                 },
             )
             .filter_map(|result| future::ready(result.ok()))
+    }
+
+    /// Ends the current inner [`Stream`] if no item arrives within `idle_max`,
+    /// which causes the outer reconnecting stream to initialize the next
+    /// connection. Closes the half-dead-connection hole (2026-07-02 incident):
+    /// a venue that keeps the socket open but stops sending data produces no
+    /// error item, so `with_termination_on_error` alone never advances.
+    /// `None` disables the timer (e.g. legitimately-sparse trade streams).
+    ///
+    /// The timer bounds the gap between CONSECUTIVE items (tokio-stream's
+    /// `timeout` re-arms on every item). `map_while` both unwraps the
+    /// `Result<Item, Elapsed>` shape introduced by `timeout` (preserving the
+    /// original item type downstream) and actually ENDS the stream on the
+    /// first `Elapsed` — `timeout` alone would keep yielding later items.
+    fn with_idle_timeout<St>(
+        self,
+        idle_max: Option<Duration>,
+        stream_key: StreamKey,
+    ) -> impl Stream<Item = impl Stream<Item = St::Item>>
+    where
+        Self: Stream<Item = St>,
+        St: Stream,
+    {
+        self.map(move |stream| match idle_max {
+            None => futures::future::Either::Left(stream),
+            Some(d) => futures::future::Either::Right(tokio_stream::StreamExt::map_while(
+                tokio_stream::StreamExt::timeout(stream, d),
+                move |item| match item {
+                    Ok(inner_item) => Some(inner_item),
+                    Err(elapsed) => {
+                        warn!(
+                            ?stream_key,
+                            idle_secs = d.as_secs(),
+                            ?elapsed,
+                            "no application data within idle_max — ending stream to force reconnect"
+                        );
+                        None
+                    }
+                },
+            )),
+        })
     }
 
     /// Terminates the inner [`Stream`] if the encountered error is determined to be unrecoverable
@@ -202,5 +243,76 @@ impl ReconnectionState {
     fn generate_sleep_future(&self) -> tokio::time::Sleep {
         let sleep_duration = std::time::Duration::from_millis(self.backoff_ms_current);
         tokio::time::sleep(sleep_duration)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use barter_instrument::exchange::ExchangeId;
+    use futures_util::StreamExt as FuturesStreamExt;
+    use std::time::Duration;
+
+    fn key() -> StreamKey {
+        StreamKey::new("test_stream", ExchangeId::BinanceSpot, Some("l2"))
+    }
+
+    /// A stream that yields the given items immediately, then stays silent forever.
+    fn items_then_silence<T: Clone + 'static>(
+        items: Vec<T>,
+    ) -> impl Stream<Item = T> {
+        futures::stream::iter(items).chain(futures::stream::pending())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_ends_a_silent_inner_stream() {
+        // outer stream of ONE inner stream that never yields
+        let outer = futures::stream::iter(vec![futures::stream::pending::<u32>()]);
+        let collected: Vec<u32> = outer
+            .with_idle_timeout(Some(Duration::from_secs(300)), key())
+            .flatten()
+            .collect()
+            .await;
+        // the inner stream ended (idle timeout), yielding nothing — and the
+        // test itself terminating proves the end (a pending stream would hang;
+        // the paused clock auto-advances past the deadline)
+        assert!(collected.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_preserves_items_and_type() {
+        let outer = futures::stream::iter(vec![items_then_silence(vec![1u32, 2, 3])]);
+        let collected: Vec<u32> = outer
+            .with_idle_timeout(Some(Duration::from_secs(300)), key())
+            .flatten()
+            .collect()
+            .await;
+        assert_eq!(collected, vec![1, 2, 3]); // items pass through; silence then ends it
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_none_passes_through_and_completes() {
+        // None => no timer at all; a FINITE inner stream completes normally
+        let outer = futures::stream::iter(vec![futures::stream::iter(vec![7u32, 8])]);
+        let collected: Vec<u32> = outer
+            .with_idle_timeout(None, key())
+            .flatten()
+            .collect()
+            .await;
+        assert_eq!(collected, vec![7, 8]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ended_inner_stream_produces_reconnecting_marker_downstream() {
+        // The composed behavior the whole fix exists for: the idle timeout ends
+        // the current inner stream, which causes with_reconnection_events to
+        // emit the Reconnecting marker (same as any inner-stream end).
+        let outer = futures::stream::iter(vec![futures::stream::pending::<u32>()]);
+        let events: Vec<Event<ExchangeId, u32>> = outer
+            .with_idle_timeout(Some(Duration::from_secs(300)), key())
+            .with_reconnection_events(ExchangeId::BinanceSpot)
+            .collect()
+            .await;
+        assert!(matches!(events.as_slice(), [Event::Reconnecting(ExchangeId::BinanceSpot)]));
     }
 }
