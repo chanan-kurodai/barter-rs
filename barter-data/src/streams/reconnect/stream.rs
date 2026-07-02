@@ -59,6 +59,9 @@ where
     /// a venue that keeps the socket open but stops sending data produces no
     /// error item, so `with_termination_on_error` alone never advances.
     /// `None` disables the timer (e.g. legitimately-sparse trade streams).
+    /// The first window arms when the connection stream is yielded, so the
+    /// timeout also bounds time-to-first-item after a successful connect —
+    /// a connection that comes up muted is caught too.
     ///
     /// The timer bounds the gap between CONSECUTIVE items (tokio-stream's
     /// `timeout` re-arms on every item). `map_while` both unwraps the
@@ -250,7 +253,6 @@ impl ReconnectionState {
 mod tests {
     use super::*;
     use barter_instrument::exchange::ExchangeId;
-    use futures_util::StreamExt as FuturesStreamExt;
     use std::time::Duration;
 
     fn key() -> StreamKey {
@@ -258,9 +260,7 @@ mod tests {
     }
 
     /// A stream that yields the given items immediately, then stays silent forever.
-    fn items_then_silence<T: Clone + 'static>(
-        items: Vec<T>,
-    ) -> impl Stream<Item = T> {
+    fn items_then_silence<T>(items: Vec<T>) -> impl Stream<Item = T> {
         futures::stream::iter(items).chain(futures::stream::pending())
     }
 
@@ -303,6 +303,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn idle_timeout_none_never_arms_a_timer() {
+        // None + a silent inner stream: even an enormous clock advance must
+        // not end the stream — proves the None arm truly has no timer.
+        let outer = futures::stream::iter(vec![futures::stream::pending::<u32>()]);
+        let stream = outer.with_idle_timeout(None, key()).flatten();
+        futures::pin_mut!(stream);
+        // poll once first: if a timer existed, this would arm it
+        assert!(futures::poll!(stream.next()).is_pending());
+        tokio::time::advance(Duration::from_secs(100_000)).await;
+        assert!(futures::poll!(stream.next()).is_pending());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_connection_delivers_after_idle_end() {
+        // The full recovery story: the first connection idles out, the outer
+        // stream advances to the next connection, and its data flows.
+        let outer = futures::stream::iter(vec![
+            items_then_silence(vec![]),     // first connection: muted, idles out
+            items_then_silence(vec![9u32]), // next connection: delivers
+        ]);
+        let collected: Vec<u32> = outer
+            .with_idle_timeout(Some(Duration::from_secs(300)), key())
+            .flatten()
+            .collect()
+            .await;
+        assert_eq!(collected, vec![9]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn ended_inner_stream_produces_reconnecting_marker_downstream() {
         // The composed behavior the whole fix exists for: the idle timeout ends
         // the current inner stream, which causes with_reconnection_events to
@@ -313,6 +342,9 @@ mod tests {
             .with_reconnection_events(ExchangeId::BinanceSpot)
             .collect()
             .await;
-        assert!(matches!(events.as_slice(), [Event::Reconnecting(ExchangeId::BinanceSpot)]));
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Reconnecting(ExchangeId::BinanceSpot)]
+        ));
     }
 }
