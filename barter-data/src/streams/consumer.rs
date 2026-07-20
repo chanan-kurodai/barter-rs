@@ -34,17 +34,35 @@ pub const STREAM_RECONNECTION_POLICY: ReconnectionBackoffPolicy = ReconnectionBa
 /// connection, re-armed by ANY instrument's item on that connection.
 pub const BOOK_IDLE_MAX_SECS: u64 = 976;
 
-/// Idle bound keyed by subscription kind. Books must never be silent for
-/// minutes; trades are legitimately sparse on thin venues (and some venues
-/// close idle connections themselves), so trades are DISABLED. Unknown kinds
-/// default to disabled (safe). Matches BOTH the SubscriptionKind::as_str()
-/// forms and the SubKind enum-variant names defensively — a future refactor
-/// to SubKind-generic calls must not silently disable the timeout.
-fn idle_timeout_for_kind(kind: &str) -> Option<Duration> {
+/// Idle bounds for TRADES streams, venue-keyed because organic trade-gap
+/// profiles differ by ~20x across venues. Measured over the clean days
+/// 2026-07-08..14 and signed off in
+/// docs/validation/2026-07-20-trades-idle-gap-measurement.md (hairpin-main
+/// repo). Rule per venue: ceil(3 x largest merged-connection organic gap).
+/// Motivated by the 2026-07-15 incident: Bitkub trades muted on both
+/// collectors for ~4.8 days with no timeout to end the silent inner stream.
+pub const BITKUB_TRADES_IDLE_MAX_SECS: u64 = 1028; // ceil(3 x 342.341s)
+pub const BINANCE_TH_TRADES_IDLE_MAX_SECS: u64 = 2482; // ceil(3 x 827.205s)
+pub const ORBIX_TRADES_IDLE_MAX_SECS: u64 = 21245; // ceil(3 x 7081.563s)
+
+/// Idle bound keyed by (exchange, subscription kind). Books use one measured
+/// constant everywhere; trades use venue-keyed constants, and are DISABLED on
+/// venues without a measurement artifact (an unmeasured threshold could end
+/// healthy sparse streams). Unknown kinds default to disabled (safe). Matches
+/// BOTH the SubscriptionKind::as_str() forms and the SubKind enum-variant
+/// names defensively — a future refactor to SubKind-generic calls must not
+/// silently disable the timeout.
+fn idle_timeout_for(exchange: ExchangeId, kind: &str) -> Option<Duration> {
     match kind {
         "l1" | "l2" | "OrderBooksL1" | "OrderBooksL2" => {
             Some(Duration::from_secs(BOOK_IDLE_MAX_SECS))
         }
+        "public_trades" | "PublicTrades" => match exchange {
+            ExchangeId::Bitkub => Some(Duration::from_secs(BITKUB_TRADES_IDLE_MAX_SECS)),
+            ExchangeId::BinanceTh => Some(Duration::from_secs(BINANCE_TH_TRADES_IDLE_MAX_SECS)),
+            ExchangeId::Orbix => Some(Duration::from_secs(ORBIX_TRADES_IDLE_MAX_SECS)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -89,7 +107,7 @@ where
     // subscriptions in every match arm.
     let idle_max = subscriptions
         .first()
-        .and_then(|sub| idle_timeout_for_kind(sub.kind.as_str()));
+        .and_then(|sub| idle_timeout_for(exchange, sub.kind.as_str()));
 
     info!(
         %exchange,
@@ -145,19 +163,66 @@ mod idle_timeout_tests {
     };
 
     #[test]
-    fn kind_mapping_pinned() {
-        // Marker-coupled assertions: survive any change to the string values.
-        assert!(idle_timeout_for_kind(OrderBooksL1.as_str()).is_some());
-        assert!(idle_timeout_for_kind(OrderBooksL2.as_str()).is_some());
-        assert!(idle_timeout_for_kind(PublicTrades.as_str()).is_none());
-        // Raw-string forms: guard both as_str() values and enum-variant names,
-        // so a future refactor to SubKind-generic calls cannot silently
-        // disable the timeout.
-        assert!(idle_timeout_for_kind("l1").is_some());
-        assert!(idle_timeout_for_kind("l2").is_some());
-        assert!(idle_timeout_for_kind("OrderBooksL1").is_some());
-        assert!(idle_timeout_for_kind("OrderBooksL2").is_some());
-        assert!(idle_timeout_for_kind("public_trades").is_none());
-        assert!(idle_timeout_for_kind("PublicTrades").is_none());
+    fn book_mapping_pinned_for_every_exchange() {
+        // Books are venue-independent: same measured constant everywhere.
+        for exchange in [
+            ExchangeId::BinanceTh,
+            ExchangeId::Bitkub,
+            ExchangeId::Orbix,
+            ExchangeId::BinanceSpot,
+        ] {
+            // Marker-coupled assertions: survive any change to the string values.
+            assert_eq!(
+                idle_timeout_for(exchange, OrderBooksL1.as_str()),
+                Some(Duration::from_secs(BOOK_IDLE_MAX_SECS))
+            );
+            assert_eq!(
+                idle_timeout_for(exchange, OrderBooksL2.as_str()),
+                Some(Duration::from_secs(BOOK_IDLE_MAX_SECS))
+            );
+            // Raw-string forms: guard both as_str() values and enum-variant
+            // names, so a future refactor to SubKind-generic calls cannot
+            // silently disable the timeout.
+            assert!(idle_timeout_for(exchange, "l1").is_some());
+            assert!(idle_timeout_for(exchange, "l2").is_some());
+            assert!(idle_timeout_for(exchange, "OrderBooksL1").is_some());
+            assert!(idle_timeout_for(exchange, "OrderBooksL2").is_some());
+        }
+    }
+
+    #[test]
+    fn trades_mapping_venue_aware() {
+        // Trades thresholds are venue-keyed: organic trade-gap profiles differ
+        // by ~20x across venues (see the 2026-07-20 measurement artifact).
+        let cases = [
+            (ExchangeId::Bitkub, BITKUB_TRADES_IDLE_MAX_SECS),
+            (ExchangeId::BinanceTh, BINANCE_TH_TRADES_IDLE_MAX_SECS),
+            (ExchangeId::Orbix, ORBIX_TRADES_IDLE_MAX_SECS),
+        ];
+        for (exchange, secs) in cases {
+            assert_eq!(
+                idle_timeout_for(exchange, PublicTrades.as_str()),
+                Some(Duration::from_secs(secs))
+            );
+            // Enum-variant name form guarded like the books.
+            assert_eq!(
+                idle_timeout_for(exchange, "PublicTrades"),
+                Some(Duration::from_secs(secs))
+            );
+        }
+    }
+
+    #[test]
+    fn trades_disabled_for_unmeasured_exchanges() {
+        // No measurement artifact for a venue => no trades timeout (fail-safe:
+        // an unmeasured threshold could end healthy sparse streams).
+        assert!(idle_timeout_for(ExchangeId::BinanceSpot, PublicTrades.as_str()).is_none());
+        assert!(idle_timeout_for(ExchangeId::BinanceSpot, "PublicTrades").is_none());
+    }
+
+    #[test]
+    fn unknown_kind_disabled() {
+        assert!(idle_timeout_for(ExchangeId::Bitkub, "liquidations").is_none());
+        assert!(idle_timeout_for(ExchangeId::Bitkub, "").is_none());
     }
 }
