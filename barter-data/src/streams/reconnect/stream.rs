@@ -49,16 +49,20 @@ where
     {
         self.enumerate()
             .scan(
-                ReconnectionState::from(policy),
-                move |state, (attempt, result)| match result {
+                (ReconnectionState::from(policy), 0u64),
+                move |(state, established), (attempt, result)| match result {
                     Ok(stream) => {
                         info!(attempt, ?stream_key, "successfully initialised Stream");
                         state.reset_backoff();
+                        // the n-th established connection (0-based) closes episode n
+                        let episode = *established;
+                        *established += 1;
                         if let Some(n) = &notify {
                             n(ReconnectNotice {
                                 exchange: stream_key.exchange,
                                 kind: stream_key.kind,
                                 phase: ReconnectPhase::ReconnectSucceeded { attempt },
+                                episode,
                             });
                         }
                         futures::future::Either::Left(future::ready(Some(Ok(stream))))
@@ -78,6 +82,9 @@ where
                                 exchange: stream_key.exchange,
                                 kind: stream_key.kind,
                                 phase: ReconnectPhase::ReconnectFailed { attempt, backoff_ms },
+                                // failures while re-establishing after the `established`-th
+                                // Reconnecting belong to that same episode
+                                episode: *established,
                             });
                         }
                         futures::future::Either::Right(Box::pin(async move {
@@ -131,10 +138,12 @@ where
         Self: Stream<Item = St>,
         St: Stream,
     {
-        self.map(move |stream| match idle_max {
+        self.enumerate().map(move |(index, stream)| match idle_max {
             None => futures::future::Either::Left(stream),
             Some(d) => {
                 let notify = notify.clone();
+                // ending the index-th inner connection is the (index + 1)-th Reconnecting
+                let episode = index as u64 + 1;
                 futures::future::Either::Right(tokio_stream::StreamExt::map_while(
                     tokio_stream::StreamExt::timeout(stream, d),
                     move |item| match item {
@@ -151,6 +160,7 @@ where
                                     exchange: stream_key.exchange,
                                     kind: stream_key.kind,
                                     phase: ReconnectPhase::IdleResetAttempted { idle_secs: d.as_secs() },
+                                    episode,
                                 });
                             }
                             None
@@ -662,5 +672,48 @@ mod idle_reset_tests {
         let n = &rec.notices.lock().unwrap();
         assert_eq!(n[1].0.kind, Some("public_trades"));
         assert_eq!(n[1].0.exchange, ExchangeId::BinanceTh);
+    }
+
+    /// Episode binding + the real interleaving a separate-channel consumer sees (2026-09-25
+    /// review F1). One shared log records notices (from the notify callback) and the events
+    /// the consumer receives, in real order. Episode 1: idle reset, two failed re-inits,
+    /// success; episode 2: idle reset, success. Asserts (a) IdleResetAttempted is sent BEFORE
+    /// its Reconnecting is yielded, (b) Failed/Succeeded are sent AFTER it (so a consumer that
+    /// prioritises the notice channel can see them first), (c) every notice carries the
+    /// ordinal of the Reconnecting it belongs to.
+    #[tokio::test(start_paused = true)]
+    async fn notices_carry_their_physical_episode_and_follow_or_precede_its_event() {
+        let (c1, _tx1, _) = conn();
+        let (c2, tx2, _) = conn();
+        let (c3, tx3, _) = conn();
+        tx2.send(20).unwrap(); // c2 speaks once, then goes silent
+        tx3.send(30).unwrap();
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let l2 = log.clone();
+        let notify: ReconnectNotify = Arc::new(move |n: ReconnectNotice| {
+            let ph = match n.phase {
+                ReconnectPhase::IdleResetAttempted { .. } => "reset".to_string(),
+                ReconnectPhase::ReconnectFailed { attempt, .. } => format!("failed#{attempt}"),
+                ReconnectPhase::ReconnectSucceeded { attempt } => format!("ok#{attempt}"),
+            };
+            l2.lock().unwrap().push(format!("notice {ph} ep{}", n.episode));
+        });
+        let s = chain(vec![Ok(c1), Err("down"), Err("down"), Ok(c2), Ok(c3)], trades_key(), Some(IDLE), Some(notify), Arc::new(AtomicUsize::new(0))).await;
+        futures::pin_mut!(s);
+        let mut reconnects = 0;
+        while reconnects < 2 || !log.lock().unwrap().iter().any(|l| l == "item 30") {
+            match s.next().await.unwrap() {
+                Event::Reconnecting(_) => { reconnects += 1; log.lock().unwrap().push(format!("event reconnecting #{reconnects}")); }
+                Event::Item(v) => log.lock().unwrap().push(format!("item {v}")),
+            }
+        }
+        let got = log.lock().unwrap().clone();
+        assert_eq!(got, vec![
+            "notice ok#0 ep0",
+            "notice reset ep1", "event reconnecting #1",
+            "notice failed#1 ep1", "notice failed#2 ep1", "notice ok#3 ep1", "item 20",
+            "notice reset ep2", "event reconnecting #2",
+            "notice ok#4 ep2", "item 30",
+        ]);
     }
 }

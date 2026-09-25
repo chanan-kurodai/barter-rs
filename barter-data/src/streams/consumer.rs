@@ -91,6 +91,14 @@ pub struct ReconnectNotice {
     /// The stream's kind string as carried by its [`StreamKey`] (`None` for general streams).
     pub kind: Option<&'static str>,
     pub phase: ReconnectPhase,
+    /// The PHYSICAL reconnect episode this notice belongs to, counted per stream: episode `k`
+    /// is the transition that the stream's `k`-th `Event::Reconnecting` announces (the end of
+    /// its `k-1`-th inner connection, 0-based). `IdleResetAttempted` for episode `k` is sent
+    /// just before that `Reconnecting` is yielded; `ReconnectFailed`/`ReconnectSucceeded` for
+    /// episode `k` are sent after it. Episode 0 is only the process's first connect. Consumers
+    /// that receive notices on a separate channel use this to bind each notice to its episode
+    /// instead of to whatever connection is current when the notice happens to be processed.
+    pub episode: u64,
 }
 
 /// Callback receiving [`ReconnectNotice`]s. Runs inside the stream combinators, so it
