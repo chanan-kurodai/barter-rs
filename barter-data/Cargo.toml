@@ -12,6 +12,7 @@ keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]
 categories = ["accessibility", "simulation"]
 
 [dev-dependencies]
+tokio-tungstenite = { workspace = true }
 tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread", "test-util"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 rust_decimal_macros = { workspace = true }

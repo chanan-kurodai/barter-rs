@@ -171,6 +171,29 @@ where
         })
     }
 
+    /// Like the merged idle guard, but every subscribed instrument must deliver
+    /// decoded application data within its own deadline. A timeout reconnects the
+    /// whole kind group and preserves the existing intervention episode numbering.
+    fn with_instrument_idle_timeout_notify<St, Key, Kind, Error>(
+        self,
+        idle_max: Option<Duration>,
+        keys: Vec<Key>,
+        stream_key: StreamKey,
+        notify: Option<ReconnectNotify>,
+    ) -> impl Stream<Item = impl Stream<Item = St::Item>>
+    where
+        Self: Stream<Item = St>,
+        St: Stream<Item = Result<crate::event::MarketEvent<Key, Kind>, Error>>,
+        Key: Clone + Eq + Debug,
+    {
+        self.enumerate().map(move |(index, stream)| match idle_max {
+            None => futures::future::Either::Left(stream),
+            Some(idle) => futures::future::Either::Right(super::instrument_idle::InstrumentIdle::new(
+                stream, keys.clone(), idle, stream_key, index as u64 + 1, notify.clone(),
+            )),
+        })
+    }
+
     /// Terminates the inner [`Stream`] if the encountered error is determined to be unrecoverable
     /// by the provided closure. This will cause the [`ReconnectingStream`] to re-initialise the
     /// inner [`Stream`].
@@ -715,5 +738,210 @@ mod idle_reset_tests {
             "notice reset ep2", "event reconnecting #2",
             "notice ok#4 ep2", "item 30",
         ]);
+    }
+}
+
+#[cfg(test)]
+mod instrument_recovery_tests {
+    use super::*;
+    use crate::{error::DataError, event::MarketEvent};
+    use barter_instrument::exchange::ExchangeId;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::UnboundedReceiverStream;
+
+    fn event(instrument: u8) -> Result<MarketEvent<u8, ()>, DataError> {
+        Ok(MarketEvent {
+            time_exchange: chrono::Utc::now(),
+            time_received: chrono::Utc::now(),
+            exchange: ExchangeId::Bitkub,
+            instrument,
+            kind: (),
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_instrument_cannot_mask_silent_sibling() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let captured = notices.clone();
+        let notify: ReconnectNotify = Arc::new(move |notice| captured.lock().unwrap().push(notice));
+        let key = StreamKey::new("market_stream", ExchangeId::Bitkub, Some("public_trades"));
+        // Feed instrument 1 while instrument 2 has never delivered a record.
+        let outer = futures::stream::iter(vec![UnboundedReceiverStream::new(rx)]);
+        let guarded = outer
+            .with_instrument_idle_timeout_notify(
+                Some(Duration::from_secs(10)),
+                vec![1, 2],
+                key,
+                Some(notify),
+            )
+            .flatten();
+        futures::pin_mut!(guarded);
+        assert!(futures::poll!(guarded.next()).is_pending());
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(3)).await;
+            tx.send(event(1)).unwrap();
+            assert_eq!(guarded.next().await.unwrap().unwrap().instrument, 1);
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            matches!(futures::poll!(guarded.next()), std::task::Poll::Ready(None)),
+            "a sibling's traffic extended the silent instrument's deadline"
+        );
+        let captured = notices.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].episode, 1);
+        assert_eq!(
+            captured[0].phase,
+            ReconnectPhase::IdleResetAttempted { idle_secs: 10 }
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn each_instrument_rearms_only_its_own_deadline() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let key = StreamKey::new("market_stream", ExchangeId::Bitkub, Some("public_trades"));
+        let guarded = futures::stream::iter(vec![UnboundedReceiverStream::new(rx)])
+            .with_instrument_idle_timeout_notify(
+                Some(Duration::from_secs(10)),
+                vec![1, 2],
+                key,
+                None,
+            )
+            .flatten();
+        futures::pin_mut!(guarded);
+        assert!(futures::poll!(guarded.next()).is_pending());
+        for instrument in [1, 2, 1, 2, 1, 2] {
+            tokio::time::advance(Duration::from_secs(3)).await;
+            tx.send(event(instrument)).unwrap();
+            assert_eq!(
+                guarded.next().await.unwrap().unwrap().instrument,
+                instrument
+            );
+        }
+        // key 1 last delivered at 15; key 2 at 18. The deadline is 25, not 28.
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(futures::poll!(guarded.next()).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tx.send(event(2)).unwrap(); // a ready sibling cannot defeat an expired timer
+        assert!(guarded.next().await.is_none());
+        assert!(tx.is_closed(), "the previous connection must be dropped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn errors_and_unknown_instruments_do_not_extend_deadlines() {
+        for item in [event(99), Err(DataError::Socket("bad payload".into()))] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let key = StreamKey::new("market_stream", ExchangeId::Bitkub, Some("public_trades"));
+            let guarded = futures::stream::iter(vec![UnboundedReceiverStream::new(rx)])
+                .with_instrument_idle_timeout_notify(
+                    Some(Duration::from_secs(10)),
+                    vec![1],
+                    key,
+                    None,
+                )
+                .flatten();
+            futures::pin_mut!(guarded);
+            assert!(futures::poll!(guarded.next()).is_pending());
+            tokio::time::advance(Duration::from_secs(9)).await;
+            tx.send(item).unwrap();
+            assert!(guarded.next().await.is_some());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(guarded.next().await.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_policy_preserves_sparse_streams() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let key = StreamKey::new("market_stream", ExchangeId::Bitkub, Some("public_trades"));
+        let guarded = futures::stream::iter(vec![UnboundedReceiverStream::new(rx)])
+            .with_instrument_idle_timeout_notify(None, vec![1, 2], key, None)
+            .flatten();
+        futures::pin_mut!(guarded);
+        assert!(futures::poll!(guarded.next()).is_pending());
+        tokio::time::advance(Duration::from_secs(86400)).await;
+        assert!(futures::poll!(guarded.next()).is_pending());
+        tx.send(event(1)).unwrap();
+        assert_eq!(guarded.next().await.unwrap().unwrap().instrument, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_drops_connection_and_retries_with_same_episode() {
+        use crate::streams::consumer::STREAM_RECONNECTION_POLICY;
+        let (tx1, rx1) = mpsc::unbounded_channel::<Result<MarketEvent<u8, ()>, DataError>>();
+        let (tx2, rx2) = mpsc::unbounded_channel::<Result<MarketEvent<u8, ()>, DataError>>();
+        let connections = Arc::new(Mutex::new(
+            vec![
+                Ok(UnboundedReceiverStream::new(rx1)),
+                Err(DataError::Socket("setup failed".into())),
+                Ok(UnboundedReceiverStream::new(rx2)),
+            ]
+            .into_iter(),
+        ));
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let copy = notices.clone();
+        let notify: ReconnectNotify = Arc::new(move |notice| copy.lock().unwrap().push(notice));
+        let key = StreamKey::new("market_stream", ExchangeId::Bitkub, Some("public_trades"));
+        let outer = init_reconnecting_stream(move || {
+            let result = connections
+                .lock()
+                .unwrap()
+                .next()
+                .expect("unexpected retry");
+            std::future::ready(result)
+        })
+        .await
+        .unwrap();
+        let guarded = outer
+            .with_reconnect_backoff_notify(STREAM_RECONNECTION_POLICY, key, Some(notify.clone()))
+            .with_instrument_idle_timeout_notify(
+                Some(Duration::from_secs(10)),
+                vec![1, 2],
+                key,
+                Some(notify),
+            )
+            .with_termination_on_error(|error| error.is_terminal(), key)
+            .with_reconnection_events(ExchangeId::Bitkub);
+        futures::pin_mut!(guarded);
+        assert!(futures::poll!(guarded.next()).is_pending());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(matches!(
+            guarded.next().await,
+            Some(Event::Reconnecting(ExchangeId::Bitkub))
+        ));
+        assert!(tx1.is_closed());
+        tx2.send(event(1)).unwrap();
+        let t0 = tokio::time::Instant::now();
+        assert!(
+            futures::poll!(guarded.next()).is_pending(),
+            "failed setup must back off"
+        );
+        assert!(matches!(guarded.next().await, Some(Event::Item(Ok(_)))));
+        assert_eq!(tokio::time::Instant::now() - t0, Duration::from_millis(125));
+        let recorded = notices.lock().unwrap();
+        assert_eq!(
+            recorded.iter().map(|n| n.episode).collect::<Vec<_>>(),
+            vec![0, 1, 1, 1]
+        );
+        assert_eq!(
+            recorded[0].phase,
+            ReconnectPhase::ReconnectSucceeded { attempt: 0 }
+        );
+        assert_eq!(
+            recorded[1].phase,
+            ReconnectPhase::IdleResetAttempted { idle_secs: 10 }
+        );
+        assert_eq!(
+            recorded[2].phase,
+            ReconnectPhase::ReconnectFailed {
+                attempt: 1,
+                backoff_ms: 125
+            }
+        );
+        assert_eq!(
+            recorded[3].phase,
+            ReconnectPhase::ReconnectSucceeded { attempt: 2 }
+        );
     }
 }

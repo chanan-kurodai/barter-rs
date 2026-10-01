@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod stream;
+mod instrument_idle;
 
 /// [`ReconnectingStream`](stream::ReconnectingStream) `Event` that communicates either `Stream::Item`, or that the inner
 /// `Stream` is currently reconnecting.

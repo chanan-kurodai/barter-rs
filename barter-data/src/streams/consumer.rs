@@ -30,8 +30,9 @@ pub const STREAM_RECONNECTION_POLICY: ReconnectionBackoffPolicy = ReconnectionBa
 /// and signed off in docs/validation/2026-07-02-stream-idle-gap-measurement.md
 /// (hairpin-main repo). Rule: max(300, ceil(3 x largest merged-connection
 /// organic gap)) = max(300, ceil(3 x 325.2s)) = 976. The merged-connection gap
-/// is the quantity this timer actually observes: one timer per (venue, kind)
-/// connection, re-armed by ANY instrument's item on that connection.
+/// remains the legacy measurement. Bitkub now applies the same duration to each
+/// instrument independently; this is a recovery policy, not a measured bound on
+/// each instrument's natural silence. Other venues retain the merged timer.
 pub const BOOK_IDLE_MAX_SECS: u64 = 976;
 
 /// Idle bound keyed by subscription kind. Books must never be silent for
@@ -59,7 +60,9 @@ fn is_trades_kind(kind: &str) -> bool {
 /// trades use the process-wide [`IdleResetPolicy`] override for that exchange, if set.
 ///
 /// **What the timer measures.** The gap between consecutive ITEMS yielded by the
-/// `MarketStream` after decoding — valid market events and decode-error items alike.
+/// `MarketStream` after decoding — valid market events and decode-error items alike
+/// for legacy merged timers. Bitkub instead tracks each subscribed instrument and
+/// refreshes its deadline only on a matching valid market event.
 /// WebSocket control frames (ping/pong) and raw bytes that produce no item do NOT
 /// re-arm it. A thin market can therefore trip it on natural silence: an idle reset is
 /// an intervention, not a confirmed outage.
@@ -191,15 +194,23 @@ where
         "MarketStream with auto reconnect initialising"
     );
 
-    Ok(init_reconnecting_stream(move || {
+    let instrument_keys = subscriptions.iter().map(|sub| sub.instrument.key().clone()).collect();
+    let streams = init_reconnecting_stream(move || {
         let subscriptions = subscriptions.clone();
-        async move { Exchange::Stream::init::<Exchange::SnapFetcher>(&subscriptions).await }
+        async move {
+            bounded_bitkub_init(exchange, Exchange::Stream::init::<Exchange::SnapFetcher>(&subscriptions)).await
+        }
     })
     .await?
-    .with_reconnect_backoff_notify(policy, stream_key, notify.clone())
-    .with_idle_timeout_notify(idle_max, stream_key, notify)
-    .with_termination_on_error(|error| error.is_terminal(), stream_key)
-    .with_reconnection_events(exchange))
+    .with_reconnect_backoff_notify(policy, stream_key, notify.clone());
+    let streams = if exchange == ExchangeId::Bitkub {
+        futures::future::Either::Left(streams.with_instrument_idle_timeout_notify(idle_max, instrument_keys, stream_key, notify)
+            .with_termination_on_error(|error| error.is_terminal(), stream_key).with_reconnection_events(exchange))
+    } else {
+        futures::future::Either::Right(streams.with_idle_timeout_notify(idle_max, stream_key, notify)
+            .with_termination_on_error(|error| error.is_terminal(), stream_key).with_reconnection_events(exchange))
+    };
+    Ok(streams)
 }
 
 #[derive(
@@ -279,5 +290,57 @@ mod idle_reset_policy_tests {
 
         assert!(set_idle_reset_policy(IdleResetPolicy::default()).is_err(), "first policy wins");
         assert_eq!(idle_timeout_for(ExchangeId::BinanceTh, "public_trades"), Some(Duration::from_secs(600)));
+    }
+}
+
+/// One deadline covers resolution, all sockets, snapshots and transformer setup.
+async fn bounded_bitkub_init<T>(
+    exchange: ExchangeId,
+    init: impl std::future::Future<Output = Result<T, DataError>>,
+) -> Result<T, DataError> {
+    if exchange == ExchangeId::Bitkub {
+        tokio::time::timeout(Duration::from_secs(30), init)
+            .await
+            .map_err(|_| {
+                DataError::Socket("Bitkub stream initialization exceeded 30 seconds".into())
+            })?
+    } else {
+        init.await
+    }
+}
+
+#[cfg(test)]
+mod bitkub_setup_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn stalled_setup_is_bounded_and_cancelled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct OnDrop(Arc<AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = OnDrop(dropped.clone());
+        let setup = async move {
+            let _guard = guard;
+            std::future::pending::<Result<(), DataError>>().await
+        };
+        let pending = bounded_bitkub_init(ExchangeId::Bitkub, setup);
+        futures::pin_mut!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(
+            matches!(
+                futures::poll!(&mut pending),
+                std::task::Poll::Ready(Err(DataError::Socket(_)))
+            ),
+            "setup was not bounded"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "cancelled setup retained its resources"
+        );
     }
 }
