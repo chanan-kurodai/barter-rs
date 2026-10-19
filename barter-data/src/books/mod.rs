@@ -20,6 +20,27 @@ pub struct OrderBook {
     time_engine: Option<DateTime<Utc>>,
     bids: OrderBookSide<Bids>,
     asks: OrderBookSide<Asks>,
+    /// Hairpin fork: the venue update-id range of the delta message this value was built from,
+    /// when the connector provides one (BinanceTh `U`/`pu`; `u` is already [`Self::sequence`]).
+    ///
+    /// Message metadata, not book state: [`OrderBook::new`] leaves it `None`, the
+    /// [`OrderBook::update`] delta path never sets it, and `#[serde(skip)]` keeps every
+    /// serialised `OrderBook` byte-identical to the pre-fork shape.
+    #[serde(skip)]
+    update_ids: Option<BookUpdateIds>,
+}
+
+/// Hairpin fork: venue update-id metadata carried by an L2 delta (see [`OrderBook::update_ids`]).
+///
+/// Binance-family diff-depth messages carry `U` (first update id in the message), `u` (final
+/// update id, already stored as [`OrderBook::sequence`]) and, on some venues, `pu` (the final
+/// update id of the previous message).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct BookUpdateIds {
+    /// Venue `U`: first update id contained in this delta message.
+    pub first_update_id: u64,
+    /// Venue `pu`: final update id of the previous delta message, when the venue sends it.
+    pub prev_final_update_id: Option<u64>,
 }
 
 impl OrderBook {
@@ -42,7 +63,20 @@ impl OrderBook {
             time_engine,
             bids: OrderBookSide::bids(bids),
             asks: OrderBookSide::asks(asks),
+            update_ids: None,
         }
+    }
+
+    /// Hairpin fork: attach the venue update-id metadata of the delta message this
+    /// [`OrderBook`] was built from. Consumes and returns `self` (builder style).
+    pub fn with_update_ids(mut self, update_ids: BookUpdateIds) -> Self {
+        self.update_ids = Some(update_ids);
+        self
+    }
+
+    /// Hairpin fork: venue update-id metadata of the delta message, if the connector set it.
+    pub fn update_ids(&self) -> Option<BookUpdateIds> {
+        self.update_ids
     }
 
     /// Current `u64` sequence number associated with the [`OrderBook`].
@@ -62,6 +96,7 @@ impl OrderBook {
             time_engine: self.time_engine,
             bids: OrderBookSide::bids(self.bids.levels.iter().take(depth).copied()),
             asks: OrderBookSide::asks(self.asks.levels.iter().take(depth).copied()),
+            update_ids: self.update_ids,
         }
     }
 
@@ -318,6 +353,53 @@ pub fn volume_weighted_mid_price(best_bid: Level, best_ask: Level) -> Decimal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod update_ids {
+        use super::*;
+
+        fn ids() -> BookUpdateIds {
+            BookUpdateIds {
+                first_update_id: 157,
+                prev_final_update_id: Some(156),
+            }
+        }
+
+        fn book() -> OrderBook {
+            OrderBook::new(160, None, vec![Level::new(10, 1)], vec![Level::new(11, 1)])
+        }
+
+        #[test]
+        fn new_has_no_update_ids_and_builder_attaches_them() {
+            assert_eq!(book().update_ids(), None);
+            assert_eq!(book().with_update_ids(ids()).update_ids(), Some(ids()));
+            // `u` stays the sequence; the builder does not touch it.
+            assert_eq!(book().with_update_ids(ids()).sequence(), 160);
+        }
+
+        #[test]
+        fn serialisation_is_unchanged_by_update_ids() {
+            let plain = serde_json::to_string(&book()).unwrap();
+            let tagged = serde_json::to_string(&book().with_update_ids(ids())).unwrap();
+            assert_eq!(plain, tagged);
+            assert!(!tagged.contains("update_ids"), "got {tagged}");
+            // (Deserialising a serialised OrderBook is not possible upstream either:
+            // `OrderBookSide::side` is `skip_serializing`; `#[serde(skip)]` defaults to None.)
+        }
+
+        #[test]
+        fn snapshot_keeps_update_ids_and_delta_update_does_not_copy_them() {
+            let tagged = book().with_update_ids(ids());
+            assert_eq!(tagged.snapshot(1).update_ids(), Some(ids()));
+
+            let mut maintained = book();
+            maintained.update(&OrderBookEvent::Update(
+                OrderBook::new(170, None, vec![Level::new(10, 2)], Vec::<Level>::new())
+                    .with_update_ids(ids()),
+            ));
+            assert_eq!(maintained.sequence(), 170);
+            assert_eq!(maintained.update_ids(), None);
+        }
+    }
 
     mod order_book_l1 {
         use super::*;
